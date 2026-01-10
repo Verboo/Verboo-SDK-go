@@ -1,0 +1,136 @@
+# Source-of-truth for VerbooRTC wire protocol and message schema.
+# - Framing: external frame header is 12 bytes (Type uint8, Flags uint8, Version uint16, StreamID uint32, Len uint32)
+# - Payload wrapper: [headerJSON][RS 0x1E][body bytes]
+# - Body encoding: Application-level payloads use a compact JSON header followed by a single
+#   Record Separator byte (RS, 0x1E) and then the raw body bytes. The JSON header is a
+#   small object with canonical fields (unknown fields MUST be ignored by decoders).
+#   This replaces the previous TLV description which is no longer used by the server.#
+# Evolution rules:
+#  - Add new fields by assigning new fieldID.
+#  - Never reuse or renumber fieldID.
+#  - For incompatible changes bump schemaMajor.
+#  - Unknown fieldID MUST be ignored by decoder.
+#
+meta:
+  name: "verboo-rtc-schema"
+  schemaMajor: 1
+  schemaMinor: 1        # bumped to reflect payload format clarification
+  description: "Protocol schema for VerbooRTC transport and application payloads. Payloads use JSON header + RS + body."
+
+enums:
+  FrameType:
+    description: "Transport-level frame types placed in frame header Type byte"
+    values:
+      FrameOpenStream: 1
+      FrameCloseStream: 2
+      FrameData: 3
+      FrameAck: 4
+      FrameNack: 5
+      FramePing: 6
+      FramePong: 7
+      FrameHello: 8
+      FrameAuth: 9
+      FrameHeartbeat: 10
+      FrameRoute: 11
+      FrameError: 12
+      FrameDatagram: 13
+      FrameMessageAck: 14
+      FrameMessageNack: 15
+      FrameMessageStatus: 16
+      FrameJoinRoom: 17
+      FrameLeaveRoom: 18
+      FrameRoomList: 19
+      FrameRoomUpdate: 20
+      FrameRoomMessage: 21
+      FramePresence: 22
+      FrameTyping: 23
+      FramePriorityUpdate: 24
+
+  FlagPriority:
+    description: "Priority bit values to be used within Frame.Flags low bits (5 bits reserved for priority)"
+    values:
+      FlagPrioritySystem: 0x01
+      FlagPriorityHigh:   0x02
+      FlagPriorityNormal: 0x04
+      FlagPriorityLow:    0x08
+      FlagPriorityBatch:  0x10
+
+  DeliveryStatus:
+    description: "Delivery status values encoded into high bits of Frame.Flags"
+    values:
+      DeliveryStatusSent:      0x20
+      DeliveryStatusDelivered: 0x40
+      DeliveryStatusRead:      0x60
+      DeliveryStatusFailed:    0x80
+
+messageTypes:
+  Hello:
+    id: 1
+    description: "Client/Server hello. Used in handshake and feature negotiation."
+    fields:
+      1: {name: "version", type: "uint16", required: true, comment: "protocol minor version or features mask"}
+      2: {name: "features", type: "stringList", required: false, comment: "list of supported feature strings"}
+
+  Auth:
+    id: 2
+    description: "Client authentication payload (sent by client)"
+    fields:
+      1: {name: "token", type: "bytes", required: true}
+      2: {name: "user_id", type: "string", required: false}
+
+  Route:
+    id: 3
+    description: "Server response: accepted route and chosen schemaMajor"
+    fields:
+      1: {name: "session_id", type: "string", required: true}
+      2: {name: "server_id", type: "string", required: true}
+      3: {name: "schema_major", type: "uint8", required: true}
+
+  ChatMessage:
+    id: 10
+    description: "Application-level chat message body"
+    fields:
+      1: {name: "message_id", type: "string", required: true}
+      2: {name: "from", type: "string", required: true}
+      3: {name: "to", type: "string", required: true}
+      4: {name: "ts", type: "uint64", required: true}
+      5: {name: "body", type: "bytes", required: true}
+      6: {name: "persistent", type: "bool", required: false}
+
+  MessageAck:
+    id: 11
+    description: "Application-level acknowledgement"
+    fields:
+      1: {name: "message_id", type: "string", required: true}
+      2: {name: "status", type: "uint8", required: true}
+
+  MsgCRUD:
+    id: 20
+    description: "CRUD control message for server-managed messages"
+    fields:
+      1: {name: "action", type: "uint8", required: true, comment: "1=create 2=get 3=delete 4=list"}
+      2: {name: "message_id", type: "string", required: false}
+      3: {name: "payload", type: "bytes", required: false}
+      4: {name: "limit", type: "uint32", required: false, comment: "for list queries"}
+      5: {name: "since_ts", type: "uint64", required: false, comment: "for pagination"}
+
+  Presence:
+    id: 30
+    description: "Presence update message"
+    fields:
+      1: {name: "user_id", type: "string", required: true}
+      2: {name: "online", type: "bool", required: true}
+      3: {name: "last_seen", type: "uint64", required: false}
+      4: {name: "device", type: "string", required: false}
+
+# Example binary fixtures (optional) to include in repo for cross-language tests
+fixtures:
+  - name: "chat_message.simple"
+    messageType: ChatMessage
+    values:
+      message_id: "msg_1"
+      from: "alice"
+      to: "bob"
+      ts: 1690000000000
+      body: "hello"
+      persistent: true

@@ -1,0 +1,56 @@
+syntax = "proto3";
+
+package pb;
+
+option go_package = "github.com/Verboo/Verboo-SDK-go/protos;pb";
+option java_multiple_files = true;
+option java_package = "com.verboo.verboo_rtc.protos";
+option csharp_namespace = "Verboo.Proto";
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// FrameMessage carries a raw encoded frame buffer. The wire format is the
+// frame header + payload as used across transports in this project.
+message FrameMessage {
+  bytes payload = 1;
+  // Optional metadata can be used by proxies/sidecars to carry routing hints.
+  map<string, string> meta = 2;
+}
+
+// RouteRequest optionally carries client-provided hints (e.g. desired features).
+message RouteRequest {
+  string hint = 1;
+}
+
+// RouteResponse returns routing metadata after a successful handshake/auth.
+message RouteResponse {
+  string session_id = 1;
+  string peer_id = 2;
+  string server_id = 3;
+  uint32 schema_major = 4;
+  repeated string features = 5;
+}
+
+// HealthResponse for unary health checks
+message HealthResponse {
+  bool ok = 1;
+  string version = 2;
+  string server_id = 3;
+  google.protobuf.Timestamp timestamp = 4;
+}
+
+// Signaling service:
+// - Signal: bidi streaming of FrameMessage; used to carry encoded frames
+//           between client and server over HTTP/2.
+// - Route (unary): get route metadata after handshake (optional for some clients).
+service Signaling {
+  // Bidirectional stream of encoded frames. Each side sends FrameMessage bytes.
+  rpc Signal (stream FrameMessage) returns (stream FrameMessage) {}
+
+  // Route RPC returns session metadata; intended for non-streaming clients or preliminary checks.
+  rpc Route (RouteRequest) returns (RouteResponse) {}
+
+  // Health RPC
+  rpc Health (google.protobuf.Empty) returns (HealthResponse) {}
+}
