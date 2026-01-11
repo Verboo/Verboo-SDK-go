@@ -10,9 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
+	"github.com/quic-go/quic-go"
+
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-	"github.com/quic-go/quic-go" // Fixed import path
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 // QuicTransport implements Transport using quic-go v0.55.x APIs.

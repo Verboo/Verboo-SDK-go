@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/config"
+	"github.com/Verboo/Verboo-SDK-go/pkg/config"
 )
 
 // AuthenticateUser validates an authentication payload (JSON with fields

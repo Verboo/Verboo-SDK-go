@@ -3,10 +3,10 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
 	"strings"
 
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 // ParsedMessage contains the parsed message data from a frame.

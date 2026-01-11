@@ -10,7 +10,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 	"github.com/Verboo/Verboo-SDK-go/sdk/client"
 )
 

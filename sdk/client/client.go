@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/Verboo/Verboo-SDK-go/sdk/transport"
 	"time"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
+	"github.com/Verboo/Verboo-SDK-go/sdk/transport"
 
 	"go.uber.org/zap"
 )

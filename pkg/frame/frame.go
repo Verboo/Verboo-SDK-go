@@ -9,8 +9,9 @@ package frame
 import (
 	"encoding/binary" // big-endian helpers
 	"errors"          // error values
-	"github.com/Verboo/Verboo-SDK-go/internal/config"
-	"sync" // sync.Pool
+	"sync"            // sync.Pool
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/config"
 )
 
 const HeaderLen = 12 // header size: Type(1)+Flags(1)+Version(2)+StreamID(4)+Len(4)

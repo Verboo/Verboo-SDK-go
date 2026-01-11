@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
-	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-
 	"github.com/quic-go/quic-go/http3"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 type HTTP3Transport struct {

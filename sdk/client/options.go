@@ -2,10 +2,11 @@ package client
 
 import (
 	"crypto/tls"
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
 	"time"
 
 	"go.uber.org/zap"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 // Option configures the client.

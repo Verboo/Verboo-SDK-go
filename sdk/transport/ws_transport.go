@@ -1,4 +1,3 @@
-// ─────── begin of ./sdk/transport/ws_transport.go ───────
 package transport
 
 import (
@@ -9,9 +8,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
-	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
 	"github.com/gorilla/websocket"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 // WsTransport: robust WebSocket binary transport that implements Transport interface.
@@ -276,5 +276,3 @@ func (w *WsTransport) Close() error {
 	w.mu.Unlock()
 	return nil
 }
-
-//─────── end of ./sdk/transport/ws_transport.go ───────

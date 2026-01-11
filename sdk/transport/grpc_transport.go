@@ -8,13 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Verboo/Verboo-SDK-go/internal/logger"
-	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-	pb "github.com/Verboo/Verboo-SDK-go/protos/gen"
-
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
+	pb "github.com/Verboo/Verboo-SDK-go/protos/gen"
 )
 
 type jwtCredentials struct {

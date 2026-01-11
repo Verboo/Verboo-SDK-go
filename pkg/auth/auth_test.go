@@ -1,12 +1,12 @@
 package auth_test
 
 import (
-	"testing"
-
-	"github.com/Verboo/Verboo-SDK-go/internal/auth"
-	"github.com/Verboo/Verboo-SDK-go/internal/config"
 	jwt "github.com/golang-jwt/jwt/v5"
+	"testing"
 	"time"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/auth"
+	"github.com/Verboo/Verboo-SDK-go/pkg/config"
 )
 
 func TestAuthenticateUser_FailsWhenNoSecret(t *testing.T) {
