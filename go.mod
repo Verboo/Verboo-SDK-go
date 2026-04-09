@@ -8,6 +8,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/joho/godotenv v1.5.1
+	github.com/klauspost/compress v1.18.2
 	github.com/quic-go/quic-go v0.58.0
 	github.com/rivo/tview v0.42.0
 	github.com/spf13/viper v1.21.0

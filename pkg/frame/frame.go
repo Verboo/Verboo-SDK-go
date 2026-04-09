@@ -9,9 +9,8 @@ package frame
 import (
 	"encoding/binary" // big-endian helpers
 	"errors"          // error values
-	"sync"            // sync.Pool
-
 	"github.com/Verboo/Verboo-SDK-go/pkg/config"
+	"sync" // sync.Pool
 )
 
 const HeaderLen = 12 // header size: Type(1)+Flags(1)+Version(2)+StreamID(4)+Len(4)
@@ -50,6 +49,33 @@ const (
 	FramePriorityUpdate FrameType = 0x18 // message priority update
 )
 
+// File transfer frame types for large file transfers between clients
+const (
+	FrameFileMetadata FrameType = 0xF0 // metadata + start of file transfer (legacy stop-and-wait)
+	FrameFileChunk    FrameType = 0xF1 // chunk of file data with index (legacy stop-and-wait)
+	FrameFileEnd      FrameType = 0xF2 // end of file transfer (includes SHA256) (legacy stop-and-wait)
+)
+
+// Virtual stream frame types for streaming file transfers via server Object Store
+const (
+	FrameVirtualStreamInit FrameType = 0xE0 // Client → Server: initialize virtual stream with payload metadata
+	FrameVirtualStreamData FrameType = 0xE1 // Client → Server: stream chunk of file data in virtual stream
+	FrameVirtualStreamEnd  FrameType = 0xE2 // Client → Server: end of virtual stream (includes SHA256)
+	FrameVirtualStreamAck  FrameType = 0xE3 // Bidirectional: acknowledge receipt of stream chunk
+)
+
+// Server-mediated file transfer frame types via NATS Object Store
+const (
+	FrameFileUploadMetadata  FrameType = 0xF3 // Client → Server (start upload to server)
+	FrameFileUploadChunk     FrameType = 0xF4 // Client → Server (file data chunk)
+	FrameFileUploadEnd       FrameType = 0xF5 // Client → Server (SHA + finish upload)
+	FrameFileAvailable       FrameType = 0xF6 // Server → Recipient (notification file ready)
+	FrameFileDownloadRequest FrameType = 0xF7 // Recipient → Server (request download)
+	FrameFileChunkServer     FrameType = 0xF8 // Server → Recipient (file chunk from Object Store)
+	FrameFileDownloadEnd     FrameType = 0xF9 // Server → Recipient (end of download)
+	FrameFileAck             FrameType = 0xFA // Bidirectional flow control acknowledgement
+)
+
 // Priority levels for message prioritization (use in Frame.Flags)
 const (
 	FlagPrioritySystem = 0x01 // system messages, calls, critical notifications
@@ -57,6 +83,7 @@ const (
 	FlagPriorityNormal = 0x04 // regular chat messages (default priority)
 	FlagPriorityLow    = 0x08 // background sync, typing indicators, presence updates
 	FlagPriorityBatch  = 0x10 // batch operations, history sync (low priority)
+	FlagPriorityMask   = 0x1F // mask for extracting priority bits from Flags (bits 0-4)
 )
 
 // Delivery status codes for message tracking
@@ -112,6 +139,90 @@ type PresenceStatus struct {
 	LastSeen int64  `json:"last_seen,omitempty"` // last seen timestamp (ms)
 	Device   string `json:"device,omitempty"`    // device type: web, mobile, desktop
 	Status   string `json:"status,omitempty"`    // user status: away, busy, available
+}
+
+// FileMetadata represents file transfer metadata (used in FrameFileMetadata frame payload)
+type FileMetadata struct {
+	FileID      string `json:"file_id"`               // unique file ID: "{sender}-{timestamp_ns}"
+	Filename    string `json:"filename"`              // original filename with extension
+	Size        int64  `json:"size"`                  // total file size in bytes
+	MIME        string `json:"mime,omitempty"`        // MIME type of the file
+	SenderID    string `json:"sender_id"`             // user ID of sender
+	TargetID    string `json:"target_id"`             // recipient or room ID
+	ChunkSize   int    `json:"chunk_size"`            // chunk size in bytes (default: 65536)
+	Compression string `json:"compression,omitempty"` // "" | "zstd" for backward compatibility
+}
+
+// FileEnd represents end-of-file transfer confirmation with checksum
+type FileEnd struct {
+	FileID      string `json:"file_id"`          // same file ID from metadata
+	TotalChunks int    `json:"total_chunks"`     // total number of chunks sent
+	SHA256      string `json:"sha256,omitempty"` // SHA256 hash of complete file (hex string)
+}
+
+// ReceivedFile represents a successfully received file
+type ReceivedFile struct {
+	FileID    string `json:"file_id"`        // unique file identifier
+	Filename  string `json:"filename"`       // original filename
+	Size      int64  `json:"size"`           // total size in bytes
+	SenderID  string `json:"sender_id"`      // user ID of sender
+	LocalPath string `json:"local_path"`     // full path where file was saved
+	MIME      string `json:"mime,omitempty"` // MIME type
+}
+
+// FileUploadMetadata represents upload initiation metadata (sent in FrameFileUploadMetadata)
+type FileUploadMetadata struct {
+	FileID      string `json:"file_id"`
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"` // ORIGINAL uncompressed size
+	MIME        string `json:"mime"`
+	Recipient   string `json:"recipient"`
+	ChunkSize   int    `json:"chunk_size"`
+	TotalChunks int    `json:"total_chunks"`
+	Compression string `json:"compression"` // "" | "zstd"
+	ResumeFrom  int    `json:"resume_from"` // used in server → client ACK
+}
+
+// FileAvailable represents file availability notification (sent in FrameFileAvailable)
+type FileAvailable struct {
+	FileID      string `json:"file_id"`
+	Filename    string `json:"filename"`
+	Size        int64  `json:"size"`        // ORIGINAL uncompressed size
+	StoredSize  int64  `json:"stored_size"` // actual bytes in SeaweedFS
+	MIME        string `json:"mime"`
+	SenderID    string `json:"sender_id"`
+	SHA256      string `json:"sha256"`
+	OriginalSHA string `json:"original_sha256"`
+	Compression string `json:"compression"` // "" | "zstd"
+	TotalChunks int    `json:"total_chunks"`
+	ChunkSize   int    `json:"chunk_size"`
+}
+
+// FileDownloadRequest represents download request from recipient (sent in FrameFileDownloadRequest)
+type FileDownloadRequest struct {
+	FileID     string `json:"file_id"`
+	StartChunk int    `json:"start_chunk"` // for resume support (v1 = 0)
+}
+
+// FileUploadEnd represents end-of-upload confirmation with SHA256 checksum
+type FileUploadEnd struct {
+	FileID      string `json:"file_id"` // same file ID from metadata
+	TotalChunks int    `json:"total_chunks"`
+	SHA256      string `json:"sha256"`          // hash of stored (compressed) bytes
+	OriginalSHA string `json:"original_sha256"` // hash of original file bytes
+}
+
+// FileAck represents flow control acknowledgement (bidirectional, used in FrameFileAck)
+// Supports both single-chunk and batch acknowledgments
+type FileAck struct {
+	FileID         string `json:"file_id"`
+	ChunkIndex     int    `json:"chunk_index,omitempty"`      // chunk index for single ACK
+	BatchSize      int    `json:"batch_size,omitempty"`       // number of chunks acknowledged (0 = single ACK)
+	LastChunkIndex int    `json:"last_chunk_index,omitempty"` // last chunk in batch (for batch ACKs)
+	Status         string `json:"status"`                     // "ok" / "error"
+	WindowSize     int    `json:"window,omitempty"`           // how many more chunks receiver can accept
+	Error          string `json:"error,omitempty"`
+	IsFileEnd      bool   `json:"is_file_end,omitempty"` // true if this is the final ACK for the file
 }
 
 // SetPriority sets message priority level in frame flags (bits 0-4)

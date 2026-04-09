@@ -10,10 +10,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
+	"github.com/quic-go/quic-go" // Fixed import path
 )
 
 // QuicTransport implements Transport using quic-go v0.55.x APIs.
@@ -116,7 +116,7 @@ func (q *QuicTransport) readLoop() {
 
 		frameLen := binary.BigEndian.Uint32(lengthBuf)
 
-		if frameLen > 10*1024*1024 {
+		if frameLen > 16*1024*1024 { // Sanity check: reject unreasonably large frames (> 16MB)
 			logger.S().Errorw("frame too large", "len", frameLen)
 			break
 		}

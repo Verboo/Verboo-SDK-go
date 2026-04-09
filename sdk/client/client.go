@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
@@ -14,36 +15,51 @@ import (
 	"go.uber.org/zap"
 )
 
-// Client represents the main VerbooRTC SDK client for connecting to the server.
+// prioritizedFrame represents a frame with priority for send queue.
+type prioritizedFrame struct {
+	f    *frame.Frame
+	prio int // 0 = high, 1 = normal, 2 = low
+}
+
+// Client is the main SDK VerbooRTC client.
 type Client struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	transport    transport.Transport
+	options      *Options
 	recvCh       chan *frame.Frame
-	sendCh       chan *frame.Frame
+	highCh       chan *prioritizedFrame // heartbeat, control frames, Ack
+	normalCh     chan *prioritizedFrame // messages, file metadata
+	lowCh        chan *prioritizedFrame // file chunks
 	token        string
 	onFrame      func(*frame.Frame)
 	onConnect    func()
 	onDisconnect func(error)
-	onMessages   []func(*frame.Frame) // List of frame handlers (not parsed messages)
+	onMessages   []func(*frame.Frame) // list of raw frame handlers
 	logger       *zap.SugaredLogger
 	handshakeErr error
 
-	presence bool
-	rooms    map[string]bool
+	presence        bool
+	rooms           map[string]bool
+	fileReceivers   map[string]*fileReceiver
+	onFileReceived  func(*frame.ReceivedFile)
+	onFileAvailable func(*frame.FileAvailable)
+	uploadSessions  map[string]*uploadSession
+	downloads       map[string]*downloadSession
+	batchAckHandler *BatchAckHandler
+	rttManager      *clientRTTManager
+	mu              sync.RWMutex
 }
 
-// NewClient creates a new VerbooRTC client instance.
+// NewClient creates a new client instance.
 func NewClient(opts ...Option) (*Client, error) {
 	options := newOptions(opts)
 
-	// Validate required token for authentication if not using default user ID
 	if options.Token == "" && options.UserID != "default-user" {
 		return nil, errors.New("JWT token must be provided")
 	}
 
-	// Create transport based on configuration
-	transport, err := transport.CreateTransport(transport.Options{
+	tp, err := transport.CreateTransport(transport.Options{
 		Addr:     options.Addr,
 		Token:    options.Token,
 		Insecure: options.Insecure,
@@ -54,29 +70,37 @@ func NewClient(opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("failed to create transport: %w", err)
 	}
 
-	// Initialize client context
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Client{
-		ctx:          ctx,
-		cancel:       cancel,
-		transport:    transport,
-		token:        options.Token,
-		logger:       options.Logger,
-		handshakeErr: nil,
-		presence:     false,
-		rooms:        make(map[string]bool),
-		onMessages:   []func(*frame.Frame){}, // Initialize empty handler list
+		ctx:             ctx,
+		cancel:          cancel,
+		transport:       tp,
+		options:         options,
+		token:           options.Token,
+		logger:          options.Logger,
+		handshakeErr:    nil,
+		presence:        false,
+		rooms:           make(map[string]bool),
+		onMessages:      []func(*frame.Frame){},
+		fileReceivers:   make(map[string]*fileReceiver),
+		uploadSessions:  make(map[string]*uploadSession),
+		downloads:       make(map[string]*downloadSession),
+		batchAckHandler: nil,
+		rttManager:      newClientRTTManager(),
+		mu:              sync.RWMutex{},
 	}
 
 	if c.logger == nil {
 		c.logger = logger.S()
 	}
 
-	// Setup channels for frame communication
-	c.recvCh = make(chan *frame.Frame, 128)
-	c.sendCh = make(chan *frame.Frame, 128)
+	// Channels with priorities
+	c.highCh = make(chan *prioritizedFrame, 1024)   //
+	c.normalCh = make(chan *prioritizedFrame, 2048) //
+	c.lowCh = make(chan *prioritizedFrame, 65536)   // large buffer for chunks
+	c.recvCh = make(chan *frame.Frame, 32768)       //
 
-	// Set up transport callbacks to handle incoming frames
+	// Callback for incoming frames from transport
 	c.transport.OnFrame(func(f *frame.Frame) {
 		if f.Type == frame.FrameHello && len(c.recvCh) > 0 {
 			frame.PutFrame(f)
@@ -84,41 +108,61 @@ func NewClient(opts ...Option) (*Client, error) {
 		}
 		c.handleIncoming(f)
 	})
+	// Wire WS reconnect: after the transport re-establishes the WebSocket
+	if wsT, ok := tp.(*transport.WsTransport); ok && options.Reconnect {
+		wsT.OnReconnect(func() {
+			c.logger.Infow("ws reconnected, performing handshake")
+			if err := c.performHandshake(); err != nil {
+				c.logger.Warnw("ws reconnect handshake failed", "err", err)
+				if c.onDisconnect != nil {
+					c.onDisconnect(fmt.Errorf("reconnect handshake failed: %w", err))
+				}
+			}
+		})
+	}
 
 	return c, nil
 }
 
-// Connect establishes a connection to the server.
+// Connect establishes connection and performs handshake.
 func (c *Client) Connect() error {
-	// Establish transport connection first
 	if err := c.transport.Connect(); err != nil {
 		return fmt.Errorf("transport connect failed: %w", err)
 	}
 
-	// Perform handshake sequence (HELLO → AUTH)
 	if err := c.performHandshake(); err != nil {
 		c.handshakeErr = err
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	// Start background goroutines for receiving, sending and heartbeats
 	c.Start()
-
 	return nil
 }
 
-// Start initializes all necessary background processes.
+// Start starts background goroutines.
 func (c *Client) Start() {
 	go c.receiveLoop()
 	go c.sendLoop()
 	go c.heartbeatLoop()
 }
 
-// SendFrame sends a frame to the server over the established connection.
-func (c *Client) SendFrame(f *frame.Frame) error {
-	// Attempt to send through channel with backpressure handling
+func (c *Client) SendPrioritized(f *frame.Frame, prio int) error {
+	if f == nil {
+		return errors.New("nil frame")
+	}
+
+	var ch chan *prioritizedFrame
+	switch prio {
+	case 0:
+		ch = c.highCh
+	case 1:
+		ch = c.normalCh
+	default:
+		ch = c.lowCh
+	}
+
 	select {
-	case c.sendCh <- f:
+	case ch <- &prioritizedFrame{f: f, prio: prio}:
 		return nil
 	default:
 		frame.PutFrame(f)
@@ -126,21 +170,15 @@ func (c *Client) SendFrame(f *frame.Frame) error {
 	}
 }
 
-// OnFrame sets a callback for raw frame processing (no parsing).
 func (c *Client) OnFrame(handler func(*frame.Frame)) {
 	c.onFrame = handler
 }
 
-// AddOnMessage adds a message parser handler that processes frames and filters according to options.
-// AddOnMessage adds a message parser handler that processes frames and filters according to options.
 func (c *Client) AddOnMessage(handler func(*ParsedMessage), opts ...ParseOption) {
-	// Create internal handler for parsing with the specified options
 	internalHandler := func(f *frame.Frame) {
-		// Only process FrameData and FrameRoomMessage types
 		if f.Type != frame.FrameData && f.Type != frame.FrameRoomMessage {
 			return
 		}
-
 		msg, err := ParseMessage(f, opts...)
 		if err != nil {
 			c.logger.Debug("failed to parse message", "err", err, "type", f.Type)
@@ -149,60 +187,55 @@ func (c *Client) AddOnMessage(handler func(*ParsedMessage), opts ...ParseOption)
 		handler(msg)
 	}
 
-	// Add the internal handler to our list of handlers
 	c.onMessages = append(c.onMessages, internalHandler)
 
-	// If this is the first handler, set up a single transport callback for all messages
 	if len(c.onMessages) == 1 {
-		// Clear previous OnFrame if it existed
-		c.transport.OnFrame(nil)
-
-		// Set new callback to handle all frames and route to our handlers
 		c.transport.OnFrame(func(f *frame.Frame) {
 			if f.Type == frame.FrameHello && len(c.recvCh) > 0 {
 				frame.PutFrame(f)
 				return
 			}
 
-			for _, handler := range c.onMessages {
-				handler(f)
+			c.handleSystemFrames(f)
+
+			for _, h := range c.onMessages {
+				h(f)
 			}
+
+			frame.PutFrame(f)
 		})
 	}
 }
 
-// OnConnect sets a callback that will be called when the client connects and completes handshake.
+// OnConnect callback on successful connection and handshake.
 func (c *Client) OnConnect(cb func()) {
 	c.onConnect = cb
 }
 
-// OnDisconnect sets a callback that will be called when the connection is closed or disconnected.
+// OnDisconnect callback on connection break.
 func (c *Client) OnDisconnect(cb func(error)) {
 	c.onDisconnect = cb
 }
 
-// Close terminates all client connections and releases resources.
+// Close closes the connection and releases resources.
 func (c *Client) Close() error {
 	defer c.cancel()
 	return c.transport.Close()
 }
 
-// SetPresence updates the user's online status in presence system.
+// SetPresence updates presence status.
 func (c *Client) SetPresence(online bool) error {
-	// Create presence update frame
 	presence := frame.PresenceStatus{
 		UserID:   c.token,
 		Online:   online,
 		LastSeen: time.Now().UnixMilli(),
 	}
 
-	// Marshal to JSON for payload
 	payload, err := json.Marshal(presence)
 	if err != nil {
 		return fmt.Errorf("failed to marshal presence: %w", err)
 	}
 
-	// Create frame with the presence data
 	f := &frame.Frame{
 		Type:     frame.FramePresence,
 		Version:  1,
@@ -210,19 +243,16 @@ func (c *Client) SetPresence(online bool) error {
 		Payload:  payload,
 	}
 
-	// Send via client's send channel
-	return c.SendFrame(f)
+	return c.SendPrioritized(f, 1)
 }
 
-// JoinRoom adds the user to a specific chat room.
+// JoinRoom joins the user to a room.
 func (c *Client) JoinRoom(roomID string) error {
-	// Prepare join request as JSON
 	payload, err := json.Marshal(map[string]string{"room_id": roomID})
 	if err != nil {
 		return fmt.Errorf("failed to marshal join request: %w", err)
 	}
 
-	// Create frame for joining the room
 	f := &frame.Frame{
 		Type:     frame.FrameJoinRoom,
 		Version:  1,
@@ -230,19 +260,16 @@ func (c *Client) JoinRoom(roomID string) error {
 		Payload:  payload,
 	}
 
-	// Send via client's send channel
-	return c.SendFrame(f)
+	return c.SendPrioritized(f, 1)
 }
 
-// LeaveRoom removes the user from a specific chat room.
+// LeaveRoom leaves the room.
 func (c *Client) LeaveRoom(roomID string) error {
-	// Prepare leave request as JSON
 	payload, err := json.Marshal(map[string]string{"room_id": roomID})
 	if err != nil {
 		return fmt.Errorf("failed to marshal leave request: %w", err)
 	}
 
-	// Create frame for leaving the room
 	f := &frame.Frame{
 		Type:     frame.FrameLeaveRoom,
 		Version:  1,
@@ -250,13 +277,11 @@ func (c *Client) LeaveRoom(roomID string) error {
 		Payload:  payload,
 	}
 
-	// Send via client's send channel
-	return c.SendFrame(f)
+	return c.SendPrioritized(f, 1)
 }
 
-// SendToRoom sends a message to all members in the specified room.
+// SendToRoom sends a message to a room.
 func (c *Client) SendToRoom(roomID, msg string) error {
-	// Build header with metadata for the message
 	header := frame.MessageHeader{
 		MessageID:  "sdk-" + time.Now().Format("150405.000"),
 		SenderID:   c.token,
@@ -265,10 +290,8 @@ func (c *Client) SendToRoom(roomID, msg string) error {
 		Persistent: true,
 	}
 
-	// Build payload in required format (headerJSON + RS + body)
 	payload := buildPayload(header, []byte(msg))
 
-	// Create frame with the message
 	f := &frame.Frame{
 		Type:     frame.FrameData,
 		Version:  1,
@@ -276,11 +299,10 @@ func (c *Client) SendToRoom(roomID, msg string) error {
 		Payload:  payload,
 	}
 
-	// Send via client's send channel
-	return c.SendFrame(f)
+	return c.SendPrioritized(f, 1)
 }
 
-// SendTextMessage sends a message to member
+// SendTextMessage sends a personal text message.
 func (c *Client) SendTextMessage(targetUserID string, message string) error {
 	header := frame.MessageHeader{
 		MessageID:  "sdk-" + time.Now().Format("150405.000"),
@@ -297,41 +319,106 @@ func (c *Client) SendTextMessage(targetUserID string, message string) error {
 		StreamID: 1,
 		Payload:  payload,
 	}
-	return c.SendFrame(f)
+	return c.SendPrioritized(f, 1)
 }
 
-// handleIncoming processes incoming frames from the server.
-func (c *Client) handleIncoming(f *frame.Frame) {
-	defer frame.PutFrame(f)
-
-	// Handle different frame types based on type
-	if f.Type == frame.FrameData || f.Type == frame.FrameHeartbeat {
-		c.onFrame(f)
-
-		// If this is a FrameRoute, trigger OnConnect callback
-		if f.Type == frame.FrameRoute && c.onConnect != nil {
-			go c.onConnect()
+// handleSystemFrames handles system frames (files, errors, etc.).
+func (c *Client) handleSystemFrames(f *frame.Frame) {
+	switch f.Type {
+	case frame.FrameHeartbeat:
+		c.rttManager.recordPong()
+	case frame.FrameFileMetadata:
+		c.logger.Debug("FrameFileMetadata received")
+		_ = c.handleFileAvailable(f) // Treat as notification only
+	case frame.FrameFileAvailable:
+		_ = c.handleFileAvailable(f)
+	case frame.FrameFileChunkServer:
+		c.logger.Debug("FrameFileChunkServer received")
+		_ = c.handleFileChunkServer(f) // Download from server (with auto-decompression)
+	case frame.FrameFileDownloadEnd:
+		c.logger.Debug("FrameFileDownloadEnd received")
+		_ = c.handleFileDownloadEnd(f)
+	case frame.FrameFileAck:
+		var ackData map[string]interface{}
+		if err := json.Unmarshal(f.Payload, &ackData); err != nil {
+			c.logger.Debugw("failed to unmarshal file ack", "err", err)
+			frame.PutFrame(f)
+			return
 		}
-	} else if f.Type == frame.FrameError {
-		// Handle error frames (e.g., authentication failure)
+
+		// create batchAckHandler if not exists
+		if c.batchAckHandler == nil {
+			c.batchAckHandler = NewBatchAckHandler(c)
+		}
+
+		err := c.batchAckHandler.HandleFileAck(ackData)
+		if err != nil {
+			c.logger.Warnw("failed to handle file ack", "err", err, "file_id", ackData["file_id"])
+		}
+
+		//  IsFileEnd = true -> file complete
+		if isFileEnd := ackData["is_file_end"]; isFileEnd == true {
+			c.logger.Infow("file download completed - received FILE_END flag",
+				"file_id", ackData["file_id"],
+				"batch_size", ackData["batch_size"],
+				"last_chunk_index", ackData["last_chunk_index"])
+		}
+
+		if isFileEnd := ackData["is_file_end"]; !(isFileEnd == true) {
+			status, _ := ackData["status"].(string)
+			c.mu.RLock()
+			fileID, _ := ackData["file_id"].(string)
+			session, exists := c.uploadSessions[fileID]
+			c.mu.RUnlock()
+
+			if exists && status == "ok" {
+				// Signal sliding window that a chunk was processed (upload)
+				select {
+				case session.ackChan <- struct{}{}:
+				default:
+					// Channel full - client is not waiting for ack, drop it gracefully
+				}
+			}
+		}
+
+		frame.PutFrame(f)
+		return
+	// Virtual stream file transfer frames (new high-performance streaming)
+	case frame.FrameVirtualStreamInit:
+		c.logger.Debug("FrameVirtualStreamInit received")
+		_ = c.handleVirtualStreamInit(f) // handle virtual stream init ack
+	case frame.FrameVirtualStreamEnd:
+		c.logger.Debug("FrameVirtualStreamEnd received")
+		_ = c.handleVirtualStreamEnd(f) // handle virtual stream end (for downloads)
+	case frame.FrameError:
 		if c.onDisconnect != nil {
 			c.onDisconnect(fmt.Errorf("server error: %s", string(f.Payload)))
 		}
+	case frame.FrameData:
+		if c.onFrame != nil {
+			c.onFrame(f)
+		}
+	case frame.FrameRoute:
+		if c.onConnect != nil {
+			go c.onConnect()
+		}
 	}
 }
 
-// performHandshake executes the full handshake sequence with the server.
+// handleIncoming handles incoming frames (called from receiveLoop).
+func (c *Client) handleIncoming(f *frame.Frame) {
+	defer frame.PutFrame(f)
+	c.handleSystemFrames(f)
+}
+
+// performHandshake performs HELLO -> AUTH sequence.
 func (c *Client) performHandshake() error {
-	// Send HELLO frame to initiate connection
 	if err := c.sendHello(); err != nil {
 		return fmt.Errorf("hello failed: %w", err)
 	}
-
-	// Send AUTH frame for authentication
 	return c.sendAuth()
 }
 
-// sendHello sends the initial HELLO frame to start handshake.
 func (c *Client) sendHello() error {
 	hello := &frame.Frame{
 		Type:    frame.FrameHello,
@@ -341,15 +428,12 @@ func (c *Client) sendHello() error {
 	return c.transport.SendFrame(hello)
 }
 
-// sendAuth sends the AUTH frame with JWT token for authentication.
 func (c *Client) sendAuth() error {
-	// Prepare authentication payload
 	auth := map[string]string{
 		"token":   c.token,
 		"user_id": c.token,
 	}
 
-	// Marshal to JSON and create frame
 	data, err := json.Marshal(auth)
 	if err != nil {
 		return fmt.Errorf("auth payload marshal failed: %w", err)
@@ -363,7 +447,6 @@ func (c *Client) sendAuth() error {
 	return c.transport.SendFrame(authF)
 }
 
-// heartbeatLoop manages periodic heartbeats to maintain connection.
 func (c *Client) heartbeatLoop() {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
@@ -371,24 +454,22 @@ func (c *Client) heartbeatLoop() {
 	for {
 		select {
 		case <-c.ctx.Done():
-			c.logger.Debug("heartbeat loop stopped")
 			return
 		case <-ticker.C:
-			// Send heartbeat frame to maintain connection
-			if err := c.transport.SendFrame(&frame.Frame{
-				Type:     frame.FrameHeartbeat,
-				Version:  1,
-				StreamID: 0,
-				Payload:  []byte{},
-			}); err != nil {
-				c.logger.Warnw("heartbeat failed", "err", err)
-				continue
+			// Heartbeat — makes session alive
+			hb := frame.GetFrame()
+			hb.Type = frame.FrameHeartbeat
+			hb.Version = 1
+			hb.StreamID = 0
+			hb.Payload = []byte{}
+			c.rttManager.recordPing()
+			if err := c.SendPrioritized(hb, DefaultPrioritySystem); err != nil {
+				c.logger.Warnw("heartbeat enqueue failed", "err", err)
 			}
 		}
 	}
 }
 
-// receiveLoop processes incoming frames from the server.
 func (c *Client) receiveLoop() {
 	for f := range c.recvCh {
 		if f == nil {
@@ -398,23 +479,55 @@ func (c *Client) receiveLoop() {
 	}
 }
 
-// sendLoop sends outgoing frames to the server.
 func (c *Client) sendLoop() {
-	for f := range c.sendCh {
-		if err := c.transport.SendFrame(f); err != nil {
-			c.logger.Warnw("send failed", "err", err, "type", f.Type)
+	for {
+		// High priority - always first
+		select {
+		case <-c.ctx.Done():
+			return
+		case pf := <-c.highCh:
+			if err := c.transport.SendFrame(pf.f); err != nil {
+				c.logger.Warnw("high send failed", "err", err, "type", pf.f.Type)
+				frame.PutFrame(pf.f)
+			}
+			continue
+		default:
+		}
 
-			select {
-			case c.sendCh <- f:
-				continue
-			default:
-				frame.PutFrame(f)
+		// Normal priority
+		select {
+		case <-c.ctx.Done():
+			return
+		case pf := <-c.normalCh:
+			if err := c.transport.SendFrame(pf.f); err != nil {
+				c.logger.Warnw("normal send failed", "err", err, "type", pf.f.Type)
+				frame.PutFrame(pf.f)
+			}
+			continue
+		default:
+		}
+
+		// Low priority or again high/normal (if appeared)
+		select {
+		case <-c.ctx.Done():
+			return
+		case pf := <-c.highCh:
+			if err := c.transport.SendFrame(pf.f); err != nil {
+				frame.PutFrame(pf.f)
+			}
+		case pf := <-c.normalCh:
+			if err := c.transport.SendFrame(pf.f); err != nil {
+				frame.PutFrame(pf.f)
+			}
+		case pf := <-c.lowCh:
+			if err := c.transport.SendFrame(pf.f); err != nil {
+				c.logger.Warnw("low send failed", "err", err, "type", pf.f.Type)
+				frame.PutFrame(pf.f)
 			}
 		}
 	}
 }
 
-// buildPayload constructs payload in the required format (headerJSON + RS + body).
 func buildPayload(header frame.MessageHeader, body []byte) []byte {
 	hdrJSON, _ := json.Marshal(header)
 	payload := make([]byte, 0, len(hdrJSON)+1+len(body))

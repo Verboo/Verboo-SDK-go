@@ -3,10 +3,10 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 	"strings"
 
 	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 )
 
 // ParsedMessage contains the parsed message data from a frame.
@@ -95,7 +95,8 @@ func ParseMessage(f *frame.Frame, opts ...ParseOption) (*ParsedMessage, error) {
 
 	// Convert body to string if requested
 	if options.asString {
-		body = []byte(string(body))
+		// Efficient copy without intermediate string allocation
+		body = append([]byte(nil), body...)
 	}
 
 	// Apply header field filtering if specified

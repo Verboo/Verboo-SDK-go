@@ -8,17 +8,19 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
+
+	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
+	pb "github.com/Verboo/Verboo-rtc/protos/gen"
+
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
-
-	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
-	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
-	pb "github.com/Verboo/Verboo-SDK-go/protos/gen"
 )
 
 type jwtCredentials struct {
-	token string
+	token    string
+	insecure bool
 }
 
 func (c *jwtCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (map[string]string, error) {
@@ -26,7 +28,7 @@ func (c *jwtCredentials) GetRequestMetadata(ctx context.Context, _ ...string) (m
 }
 
 func (c *jwtCredentials) RequireTransportSecurity() bool {
-	return true // требует TLS для безопасности
+	return !c.insecure // Does not require TLS when insecure=true
 }
 
 // GRPCTransport implements Transport interface for Verboo-RTC using gRPC bidirectional stream
@@ -42,11 +44,11 @@ type GRPCTransport struct {
 	backoff    time.Duration // Current backoff duration
 	maxBackoff time.Duration // Maximum backoff interval
 
-	insecure  bool        // Используем отдельное поле вместо opts
-	tlsConfig *tls.Config // Новое поле для хранения TLS-конфигурации
+	insecure  bool        // don't require TLS when insecure=true
+	tlsConfig *tls.Config // New field to store TLS configuration
 
-	recvMu sync.RWMutex       // Добавлено для синхронизации OnFrame
-	cb     func(*frame.Frame) // Добавлено для callback в OnFrame
+	recvMu sync.RWMutex       // Added for OnFrame synchronization
+	cb     func(*frame.Frame) // Added for callback in OnFrame
 	cancel context.CancelFunc
 	ctx    context.Context
 }
@@ -62,7 +64,7 @@ func NewGRPCClient(opts Options) (Transport, error) {
 		backoff:    time.Second,      // Initial backoff at 1 second
 		maxBackoff: 30 * time.Second, // Maximum backoff interval should be reasonable for production
 		insecure:   opts.Insecure,
-		tlsConfig:  opts.TlsCfg, // Передаем TLS-конфигурацию
+		tlsConfig:  opts.TlsCfg, // Pass TLS configuration
 	}, nil
 }
 
@@ -84,7 +86,7 @@ func (g *GRPCTransport) Connect() error {
 	var dialOpts []grpc.DialOption
 
 	if g.jwtToken != "" {
-		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&jwtCredentials{token: g.jwtToken}))
+		dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(&jwtCredentials{token: g.jwtToken, insecure: g.insecure}))
 	}
 
 	if tlsCfg != nil {
@@ -107,6 +109,31 @@ func (g *GRPCTransport) Connect() error {
 	}
 
 	go g.recvLoop()
+
+	// Start heartbeat goroutine to keep stream alive (prevents NAT/load balancer timeouts)
+	go func() {
+		ticker := time.NewTicker(25 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-g.ctx.Done():
+				return
+			case <-ticker.C:
+				// Send heartbeat frame to keep stream alive
+				heartbeat := &frame.Frame{
+					Type:     frame.FrameHeartbeat,
+					Version:  1,
+					StreamID: 0,
+					Payload:  []byte{},
+				}
+				if err := g.SendFrame(heartbeat); err != nil {
+					logger.S().Debugw("gRPC heartbeat failed", "err", err)
+					return
+				}
+				logger.S().Debug("gRPC heartbeat sent")
+			}
+		}
+	}()
 
 	logger.S().Infow("gRPC transport connected", "addr", g.addr)
 	return nil
@@ -142,7 +169,7 @@ func (g *GRPCTransport) recvLoop() {
 			// Transfer ownership to callback; the callback must call frame.PutFrame when done
 			cb(f)
 		} else {
-			// No callback — return to pool
+			// No callback - return to pool
 			frame.PutFrame(f)
 		}
 	}
@@ -167,13 +194,14 @@ func (g *GRPCTransport) SendFrame(f *frame.Frame) error {
 	if err != nil {
 		return fmt.Errorf("frame encode failed: %w", err)
 	}
-	defer frame.ReleaseEncoded(data)
 
+	// REMOVE defer - we call ReleaseEncoded ONLY once after successful send
 	if err := g.stream.Send(&pb.FrameMessage{Payload: data}); err != nil {
-		frame.ReleaseEncoded(data)
+		frame.ReleaseEncoded(data) // release only on error
 		return fmt.Errorf("gRPC send failed: %w", err)
 	}
 
+	frame.ReleaseEncoded(data) // release after successful send - ONCE!
 	logger.S().Debugw("gRPC frame sent", "type", f.Type, "size", len(data))
 	return nil
 }
@@ -188,15 +216,13 @@ func (g *GRPCTransport) Close() error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if g.conn == nil {
-		return nil
-	}
-
 	if g.stream != nil {
 		g.stream.CloseSend()
+		g.stream = nil
 	}
 	if g.conn != nil {
 		g.conn.Close()
+		g.conn = nil
 	}
 
 	g.cancel()
@@ -213,13 +239,34 @@ func (g *GRPCTransport) minDuration(a, b time.Duration) time.Duration {
 }
 
 func (g *GRPCTransport) reconnect() error {
-	if err := g.Connect(); err != nil {
-		logger.S().Warnw("gRPC reconnect failed", "err", err)
-		time.Sleep(g.backoff)
-		g.backoff = g.minDuration(g.backoff*2, g.maxBackoff)
-		return err
+	// Close old connection before attempting to reconnect
+	g.mu.Lock()
+	if g.stream != nil {
+		g.stream.CloseSend()
+		g.stream = nil
 	}
-	g.backoff = time.Second // Reset backoff on successful reconnect
-	logger.S().Infow("gRPC reconnected successfully")
-	return nil
+	if g.conn != nil {
+		g.conn.Close()
+		g.conn = nil
+	}
+	g.mu.Unlock()
+
+	// Backoff loop with context check
+	for {
+		select {
+		case <-g.ctx.Done():
+			return g.ctx.Err()
+		case <-time.After(g.backoff):
+		}
+
+		if err := g.Connect(); err == nil {
+			g.backoff = time.Second // Reset backoff on success
+			logger.S().Infow("gRPC reconnected successfully")
+			return nil
+		}
+
+		// Exponential backoff on failure
+		g.backoff = g.minDuration(g.backoff*2, g.maxBackoff)
+		logger.S().Warnw("gRPC reconnect attempt failed", "backoff", g.backoff)
+	}
 }

@@ -2,11 +2,11 @@ package client
 
 import (
 	"crypto/tls"
-	"time"
-
 	"go.uber.org/zap"
-
-	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
+	"go.uber.org/zap/zapcore"
+	"io"
+	"os"
+	"time"
 )
 
 // Option configures the client.
@@ -27,6 +27,16 @@ type Options struct {
 	Timeout    time.Duration      `json:"timeout"` // Timeout
 	Secret     string             // Add this field for secret key
 	UserID     string             // Add this field for user ID (optional)
+
+	// File transfer options
+	FileChunkSize        int                     // Chunk size for file transfers (default: 64 KiB)
+	DownloadDir          string                  // Directory to save received files (default: "./downloads")
+	UploadDir            string                  // Optional directory for uploaded files
+	AutoDownloadFiles    bool                    // Auto-download files when notification received (default: true)
+	FileProgressCallback func(sent, total int64) // Callback for send progress updates
+
+	// Logging options
+	LogOutput zapcore.WriteSyncer // Custom log output (nil = os.Stderr by default)
 }
 
 // WithToken sets the JWT token for authentication.
@@ -66,6 +76,14 @@ func WithLogger(l *zap.SugaredLogger) Option {
 	}
 }
 
+// WithLogOutput sets the log output writer. When nil, uses os.Stderr.
+// Use this for TUI apps to redirect logs away from terminal buffer.
+func WithLogOutput(w io.Writer) Option {
+	return func(o *Options) {
+		o.LogOutput = zapcore.AddSync(w)
+	}
+}
+
 // WithInsecure skips TLS verification.
 func WithInsecure() Option {
 	return func(o *Options) {
@@ -94,18 +112,47 @@ func WithSecretKey(secret string) Option {
 	}
 }
 
+// WithFileChunkSize sets chunk size for file transfers (default: 64 KiB).
+func WithFileChunkSize(size int) Option {
+	return func(o *Options) {
+		o.FileChunkSize = size
+	}
+}
+
+// WithDownloadDir sets directory to save received files.
+func WithDownloadDir(dir string) Option {
+	return func(o *Options) {
+		o.DownloadDir = dir
+	}
+}
+
+// WithUploadDir sets directory for uploaded files (optional).
+func WithUploadDir(dir string) Option {
+	return func(o *Options) {
+		o.UploadDir = dir
+	}
+}
+
+// WithFileProgressCallback sets callback for file transfer progress updates.
+func WithFileProgressCallback(cb func(sent, total int64)) Option {
+	return func(o *Options) {
+		o.FileProgressCallback = cb
+	}
+}
+
 // newOptions creates a default Options structure with defaults.
 func newOptions(opts []Option) *Options {
 	opt := &Options{
-		Token:      "",   // Token must be set by caller
-		Mode:       "ws", // Default transport is WebSocket
-		Reconnect:  true, // Default to enable reconnect
-		MinBackoff: time.Second,
-		MaxBackoff: 30 * time.Second,
-		Insecure:   false,
-		Debug:      false, // Default to off
-		Timeout:    8 * time.Second,
-		UserID:     "default-user", // Default user ID
+		Token:             "",   // Token must be set by caller
+		Mode:              "ws", // Default transport is WebSocket
+		Reconnect:         true, // Default to enable reconnect
+		MinBackoff:        time.Second,
+		MaxBackoff:        30 * time.Second,
+		Insecure:          false,
+		Debug:             false, // Default to off
+		Timeout:           8 * time.Second,
+		UserID:            "default-user", // Default user ID
+		AutoDownloadFiles: true,           // Auto-download files by default
 	}
 
 	for _, o := range opts {
@@ -117,20 +164,22 @@ func newOptions(opts []Option) *Options {
 	}
 
 	if opt.Logger == nil {
-		opt.Logger = logger.S()
-
-		//
-		if opt.Debug {
-			l, err := zap.NewDevelopment()
-			if err == nil {
-				opt.Logger = l.Sugar()
-			}
-		} else {
-			l, err := zap.NewProduction()
-			if err == nil {
-				opt.Logger = l.Sugar()
-			}
+		// Determine log output: custom LogOutput or default os.Stderr
+		output := zapcore.AddSync(os.Stderr)
+		// Default to stderr
+		if opt.LogOutput != nil {
+			output = opt.LogOutput
 		}
+
+		var core zapcore.Core
+		if opt.Debug {
+			enc := zapcore.NewConsoleEncoder(zap.NewDevelopmentEncoderConfig())
+			core = zapcore.NewCore(enc, output, zapcore.DebugLevel)
+		} else {
+			enc := zapcore.NewJSONEncoder(zap.NewProductionEncoderConfig())
+			core = zapcore.NewCore(enc, output, zapcore.InfoLevel)
+		}
+		opt.Logger = zap.New(core).Sugar()
 	}
 
 	return opt

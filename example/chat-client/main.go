@@ -4,12 +4,14 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
+	"github.com/Verboo/Verboo-SDK-go/pkg/frame"
 	"github.com/Verboo/Verboo-SDK-go/pkg/logger"
 	"github.com/Verboo/Verboo-SDK-go/sdk/client"
 )
@@ -23,7 +25,7 @@ import (
 
 // Main function initializes the Verboo-RTC SDK client with a TUI interface for interactive messaging.
 func main() {
-	// Инициализируем логгер
+	// Initialize logger
 	logger.Init(logger.S())
 
 	var (
@@ -66,8 +68,9 @@ func main() {
 		func(o *client.Options) {
 			o.Insecure = *insecure
 			o.Debug = *debug
-			o.TlsCfg = tlsCfg // Добавляем TLSConfig в Options
+			o.TlsCfg = tlsCfg // Adding TLSConfig to Options
 		},
+		client.WithDownloadDir("./downloads"), // Set download directory for received files
 	)
 	if err != nil {
 		logger.S().Fatalf("failed to create client: %v", err)
@@ -92,39 +95,11 @@ func main() {
 
 	// DEMONSTRATION HANDLERS for message filtering
 
-	// Full handler demonstrates the complete message structure with all header fields.
-	c.AddOnMessage(func(msg *client.ParsedMessage) {
-		line := fmt.Sprintf("[Full] From:%s To:%s Body:%s",
-			msg.Header.SenderID, msg.Header.TargetID, string(msg.Body))
-
-		fmt.Fprintf(logView, "[white]%s\n", tview.Escape(line))
-	},
-		client.WithFilter([]string{"message_id", "sequence", "ts", "from", "to", "persistent"}))
-
-	// Filter: from handler shows only the 'from' field and message body.
-	c.AddOnMessage(func(msg *client.ParsedMessage) {
-		line := fmt.Sprintf("[Filter:from] %s: %s",
-			msg.Header.SenderID, string(msg.Body))
-
-		fmt.Fprintf(logView, "[cyan]%s\n", tview.Escape(line))
-	},
-		client.WithFilter([]string{"from"}))
-
-	// Filter: ts handler shows timestamp and body as a string.
-	c.AddOnMessage(func(msg *client.ParsedMessage) {
-		line := fmt.Sprintf("[Filter:ts] Time:%d Body:%s",
-			msg.Header.Timestamp, string(msg.Body))
-
-		fmt.Fprintf(logView, "[green]%s\n", tview.Escape(line))
-	},
-		client.WithFilter([]string{"ts"}),
-		client.WithBodyAsString())
-
 	// Only body handler returns just the message body without any headers.
 	c.AddOnMessage(func(msg *client.ParsedMessage) {
-		line := fmt.Sprintf("[Only Body] %s", string(msg.Body))
+		line := fmt.Sprintf("From: %s", string(msg.Body))
 
-		fmt.Fprintf(logView, "[yellow]%s\n", tview.Escape(line))
+		fmt.Fprintf(logView, "[green]%s\n", tview.Escape(line))
 	},
 		client.WithIgnoreHeader())
 
@@ -138,11 +113,69 @@ func main() {
 		fmt.Fprintf(logView, "[red]Disconnected: %v\n", err)
 	})
 
-	// Input field handling for sending messages
+	// File received handler displays information about received files in TUI (from server Object Store)
+	c.OnFileReceived(func(f *frame.ReceivedFile) {
+		app.QueueUpdateDraw(func() {
+			fmt.Fprintf(logView, "[green][FILE RECEIVED from Server] %s (%.1f MB) from %s\n",
+				f.Filename, float64(f.Size)/1e6, f.SenderID)
+			fmt.Fprintf(logView, "[cyan]Saved to: %s\n", f.LocalPath)
+		})
+	})
+
+	// File available notification handler (new feature - server-mediated file transfer)
+	c.OnFileAvailable(func(f *frame.FileAvailable) {
+		app.QueueUpdateDraw(func() {})
+	})
+
+	// Create downloads directory at startup
+	if err := os.MkdirAll("./downloads", 0755); err != nil {
+		logger.S().Warnw("failed to create downloads directory", "err", err)
+	}
+	logView.Write([]byte(fmt.Sprintf("[yellow]Downloads directory: ./downloads\n")))
+
+	// Input field handling for sending messages and file transfers
 	input.SetDoneFunc(func(key tcell.Key) {
 		if key == tcell.KeyEnter {
 			text := strings.TrimSpace(input.GetText())
 			if text == "" {
+				return
+			}
+
+			// Handle file transfer command: /sendfile <path> (uses virtual streams - sliding window!)
+			if strings.HasPrefix(text, "/sendfile ") {
+				path := strings.TrimSpace(text[10:])
+				fmt.Fprintf(logView, "[yellow]Uploading file via Virtual Stream: %s → target: %s (background mode)\n", path, *targetID)
+				input.SetText("")
+				go func() {
+					err := c.SendVirtualStream(*targetID, path)
+					app.QueueUpdateDraw(func() {
+						if err != nil {
+							fmt.Fprintf(logView, "[red]Failed to upload file: %v\n", err)
+						} else {
+							fmt.Fprintf(logView, "[green]File uploaded successfully via Virtual Stream\n")
+						}
+					})
+				}()
+				return
+			}
+			if strings.EqualFold(text, "/exit") || strings.EqualFold(text, "/quit") {
+				app.Stop()
+				return
+			}
+
+			// Handle download command: /download <file_id> (retrieves file from server Object Store)
+			if strings.HasPrefix(text, "/download ") {
+				fileID := strings.TrimSpace(text[10:])
+				fmt.Fprintf(logView, "[yellow]Downloading file from Server Object Store: %s\n", fileID)
+
+				// DownloadFile retrieves file from server Object Store with flow control (FrameFileAck)
+				if err := c.DownloadFile(fileID); err != nil {
+					fmt.Fprintf(logView, "[red]Failed to download file: %v\n", err)
+				} else {
+					fmt.Fprintf(logView, "[green]Download started from server Object Store...\n")
+				}
+
+				input.SetText("")
 				return
 			}
 
